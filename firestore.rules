@@ -1,18 +1,187 @@
-rules_version='2'
+rules_version='2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /{document=**} {
-      // This rule allows anyone with your database reference to view, edit,
-      // and delete all data in your database. It is useful for getting
-      // started, but it is configured to expire after 30 days because it
-      // leaves your app open to attackers. At that time, all client
-      // requests to your database will be denied.
-      //
-      // Make sure to write security rules for your app before that time, or
-      // else all client requests to your database will be denied until you
-      // update your rules.
-      allow read, write: if request.time < timestamp.date(2026, 4, 27);
+
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users/{userId}
+    //   - name: string (required, 1-100 chars)
+    //   - email: string (required, valid email)
+    //   - role: string (required, one of: "patient", "caregiver", "doctor")
+    //   - deviceId: string (optional, for patients only)
+    //   - linkedPatients: list of strings (optional, for caregivers/doctors)
+    //   - createdAt: timestamp (required, immutable)
+    //
+    // Subcollection: users/{userId}/readings/{readingId}
+    //   - heartRate: number (required, 0-300)
+    //   - spo2: number (required, 0-100)
+    //   - temperature: number (optional, -1 or 30-45)
+    //   - alertLevel: string (required, one of: "normal", "warning", "critical")
+    //   - deviceId: string (required, 1-50 chars)
+    //   - timestamp: timestamp (required)
+    //
+    // Collection: alerts/{alertId}
+    //   - patientId: string (required)
+    //   - patientName: string (required, 1-100 chars)
+    //   - type: string (required, one of defined alert types)
+    //   - value: number (required)
+    //   - threshold: number (required)
+    //   - message: string (required, 1-500 chars)
+    //   - alertLevel: string (required, one of: "warning", "critical")
+    //   - timestamp: timestamp (required)
+    //   - acknowledged: boolean (required)
+    //   - acknowledgedBy: string (optional)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function getUserRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isCaregiver() {
+      return isAuthenticated() && getUserRole() == 'caregiver';
+    }
+
+    function isDoctor() {
+      return isAuthenticated() && getUserRole() == 'doctor';
+    }
+
+    function isLinkedToPatient(patientId) {
+      let userData = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      return userData.linkedPatients is list && patientId in userData.linkedPatients;
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidUserCreate(data) {
+      return hasRequiredFields(['name', 'email', 'role', 'createdAt']) &&
+        hasOnlyAllowedFields(['name', 'email', 'role', 'deviceId', 'linkedPatients', 'createdAt']) &&
+        data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+        data.email is string && data.email.size() > 0 && data.email.size() <= 320 &&
+        data.role in ['patient', 'caregiver', 'doctor'] &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidUserUpdate(data) {
+      return hasOnlyAllowedFields(['name', 'email', 'role', 'deviceId', 'linkedPatients', 'createdAt']) &&
+        data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+        data.email is string && data.email.size() > 0 && data.email.size() <= 320 &&
+        // Role and createdAt are immutable
+        data.role == resource.data.role &&
+        data.createdAt == resource.data.createdAt;
+    }
+
+    function isValidReading(data) {
+      return hasRequiredFields(['heartRate', 'spo2', 'alertLevel', 'deviceId', 'timestamp']) &&
+        hasOnlyAllowedFields(['heartRate', 'spo2', 'temperature', 'alertLevel', 'deviceId', 'timestamp']) &&
+        data.heartRate is number && data.heartRate >= 0 && data.heartRate <= 300 &&
+        data.spo2 is number && data.spo2 >= 0 && data.spo2 <= 100 &&
+        data.alertLevel in ['normal', 'warning', 'critical'] &&
+        data.deviceId is string && data.deviceId.size() > 0 && data.deviceId.size() <= 50 &&
+        data.timestamp is timestamp;
+    }
+
+    function isValidAlertCreate(data) {
+      return hasRequiredFields(['patientId', 'patientName', 'type', 'value', 'threshold',
+                                'message', 'alertLevel', 'timestamp', 'acknowledged']) &&
+        hasOnlyAllowedFields(['patientId', 'patientName', 'type', 'value', 'threshold',
+                              'message', 'alertLevel', 'timestamp', 'acknowledged', 'acknowledgedBy']) &&
+        data.patientId is string && data.patientId.size() > 0 &&
+        data.patientName is string && data.patientName.size() > 0 && data.patientName.size() <= 100 &&
+        data.type in ['high_heart_rate', 'low_heart_rate', 'low_spo2', 'low_temperature', 'high_temperature'] &&
+        data.value is number &&
+        data.threshold is number &&
+        data.message is string && data.message.size() > 0 && data.message.size() <= 500 &&
+        data.alertLevel in ['warning', 'critical'] &&
+        data.timestamp is timestamp &&
+        data.acknowledged == false;
+    }
+
+    // ===============================================================
+    // Rules: users/{userId}
+    // ===============================================================
+    match /users/{userId} {
+      // Users can read their own profile
+      // Caregivers/doctors can read profiles of linked patients
+      allow read: if isOwner(userId)
+                  || ((isCaregiver() || isDoctor()) && isLinkedToPatient(userId));
+
+      // Users can create their own profile — role must be "patient" for self-registration
+      // Caregivers and doctors must be assigned by an admin (or manually in console)
+      allow create: if isOwner(userId)
+                    && isValidUserCreate(request.resource.data)
+                    && request.resource.data.role == 'patient';
+
+      // Users can update their own profile (role is immutable)
+      allow update: if isOwner(userId) && isValidUserUpdate(request.resource.data);
+
+      // No client-side deletes
+      allow delete: if false;
+
+      // ===============================================================
+      // Rules: users/{userId}/readings/{readingId}
+      // ===============================================================
+      match /readings/{readingId} {
+        // Patient can read own readings
+        // Linked caregivers/doctors can read patient's readings
+        allow read: if isOwner(userId)
+                    || ((isCaregiver() || isDoctor()) && isLinkedToPatient(userId));
+
+        // Patient (or device auth) can create readings for themselves
+        allow create: if isAuthenticated() && isValidReading(request.resource.data);
+
+        // Readings are immutable — no updates or deletes
+        allow update: if false;
+        allow delete: if false;
+      }
+    }
+
+    // ===============================================================
+    // Rules: alerts/{alertId}
+    // ===============================================================
+    match /alerts/{alertId} {
+      // Patients can read their own alerts
+      // Caregivers/doctors can read alerts for their linked patients
+      allow read: if isAuthenticated()
+                  && (resource.data.patientId == request.auth.uid
+                      || ((isCaregiver() || isDoctor()) && isLinkedToPatient(resource.data.patientId)));
+
+      // Authenticated users can create alerts (client-side alert generation)
+      allow create: if isAuthenticated() && isValidAlertCreate(request.resource.data);
+
+      // Only doctors can acknowledge alerts (update acknowledged + acknowledgedBy only)
+      allow update: if isDoctor()
+                    && isLinkedToPatient(resource.data.patientId)
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['acknowledged', 'acknowledgedBy'])
+                    && request.resource.data.acknowledged == true
+                    && request.resource.data.acknowledgedBy == request.auth.uid;
+
+      allow delete: if false;
     }
   }
 }
